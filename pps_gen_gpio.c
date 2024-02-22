@@ -30,14 +30,23 @@ MODULE_AUTHOR("Victor Kirhenshtein <victor@netxms.com>");
 MODULE_DESCRIPTION(DRVDESC);
 MODULE_LICENSE("GPL");
 
-#define SAFETY_INTERVAL_NS       (10 * NSEC_PER_USEC)    /* 10us */
-#define RAISE_EVENT_TOLERANCE_NS (100 * NSEC_PER_MSEC)   /* 100ms */
+#define SAFETY_INTERVAL_NS             (10 * NSEC_PER_USEC)   /* 10us */
+#define RESET_EDGE_EVENT_TOLERANCE_NS  (10 * NSEC_PER_MSEC)   /* 10ms */
 
-enum pps_gen_gpio_level
+enum pps_sync_mode
 {
-	PPS_GPIO_LOW = 0,
-	PPS_GPIO_HIGH
+   PPS_SYNC_RAISING_EDGE = 0,
+   PPS_SYNC_FALLING_EDGE = 1
 };
+
+/* Module parameters. */
+static unsigned int pps_sync_mode = PPS_SYNC_RAISING_EDGE;
+MODULE_PARM_DESC(mode, "Synchronization mode (0 = raising edge, 1 = falling edge)");
+module_param_named(mode, pps_sync_mode, uint, 0000);
+
+static unsigned int pps_pulse_width = 200;
+MODULE_PARM_DESC(width, "Pulse width in milliseconds");
+module_param_named(width, pps_pulse_width, uint, 0000);
 
 enum pps_gen_gpio_state
 {
@@ -51,14 +60,18 @@ enum pps_gen_gpio_state
 struct pps_gen_gpio_devdata
 {
 	struct gpio_desc *pps_gpio;     /* GPIO port descriptor */
-	struct hrtimer timer_drop;
-	struct hrtimer timer_raise;
+	struct hrtimer timer_sync_edge;
+	struct hrtimer timer_reset_edge;
 	long gpio_write_time;           /* measured port write time (ns) */
    int state;
 };
 
 /* Average of hrtimer interrupt latency. */
 static long hrtimer_avg_latency = SAFETY_INTERVAL_NS;
+
+/* Levels for sync and reset edges */
+static int gpio_sync = 1;
+static int gpio_reset = 0;
 
 static ssize_t get_active_flag(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -90,6 +103,16 @@ static ssize_t get_gpio_write_time(struct device *dev, struct device_attribute *
    return sprintf(buf, "%ld", devdata->gpio_write_time);
 }
 
+static ssize_t get_pulse_width(struct device *dev, struct device_attribute *attr, char *buf)
+{
+   return sprintf(buf, "%u", pps_pulse_width);
+}
+
+static ssize_t get_sync_mode(struct device *dev, struct device_attribute *attr, char *buf)
+{
+   return sprintf(buf, "%s-edge", pps_sync_mode == PPS_SYNC_RAISING_EDGE ? "raising" : "falling");
+}
+
 static ssize_t get_timer_latency(struct device *dev, struct device_attribute *attr, char *buf)
 {
    return sprintf(buf, "%ld", hrtimer_avg_latency);
@@ -97,10 +120,14 @@ static ssize_t get_timer_latency(struct device *dev, struct device_attribute *at
 
 static DEVICE_ATTR(active, S_IRUGO | S_IWUSR, get_active_flag, set_active_flag);
 static DEVICE_ATTR(gpio_write_time, S_IRUGO, get_gpio_write_time, NULL);
+static DEVICE_ATTR(mode, S_IRUGO, get_sync_mode, NULL);
+static DEVICE_ATTR(pulse_width, S_IRUGO, get_pulse_width, NULL);
 static DEVICE_ATTR(timer_latency, S_IRUGO, get_timer_latency, NULL);
 static struct attribute *state_attrs[] = {
    &dev_attr_active.attr,
    &dev_attr_gpio_write_time.attr,
+   &dev_attr_mode.attr,
+   &dev_attr_pulse_width.attr,
    &dev_attr_timer_latency.attr,
    NULL
 };
@@ -129,12 +156,15 @@ static inline void update_hrtimer_latency(struct timespec64 ts_expire_real, stru
 		hrtimer_avg_latency = (3 * hrtimer_avg_latency + hrtimer_latency) / 4;
 }
 
-/* hrtimer raise event callback */
-static enum hrtimer_restart hrtimer_callback_raise(struct hrtimer *timer)
+/* hrtimer front edge event callback */
+static enum hrtimer_restart hrtimer_callback_reset_edge(struct hrtimer *timer)
 {
 	unsigned long irq_flags;
-	struct pps_gen_gpio_devdata *devdata = container_of(timer, struct pps_gen_gpio_devdata, timer_raise);
-	const long time_gpio_assert_ns = NSEC_PER_SEC / 2 - devdata->gpio_write_time;
+	struct pps_gen_gpio_devdata *devdata = container_of(timer, struct pps_gen_gpio_devdata, timer_reset_edge);
+	const long time_gpio_change_ns =
+      (pps_sync_mode == PPS_SYNC_RAISING_EDGE) ?
+         pps_pulse_width * NSEC_PER_MSEC - devdata->gpio_write_time :
+         (1000 - pps_pulse_width) * NSEC_PER_MSEC - devdata->gpio_write_time;
 	struct timespec64 ts_expire_req, ts_expire_real, ts_gpio_write_time, ts1, ts2;
 
    if (devdata->state == PPS_GPIO_INACTIVE)
@@ -155,10 +185,10 @@ static enum hrtimer_restart hrtimer_callback_raise(struct hrtimer *timer)
 	/* Get current timestamp and requested time to check if we are late. Much higher tolerance can be used for raise event. */
 	ktime_get_real_ts64(&ts_expire_real);
 	ts_expire_req = ktime_to_timespec64(hrtimer_get_softexpires(timer));
-	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec || ts_expire_real.tv_nsec > time_gpio_assert_ns + RAISE_EVENT_TOLERANCE_NS)
+	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec || ts_expire_real.tv_nsec > time_gpio_change_ns + RESET_EDGE_EVENT_TOLERANCE_NS)
    {
 		local_irq_restore(irq_flags);
-		pr_err("pps_gen_gpio: raise event is too late [%lld.%09ld]\n", ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
+		pr_err("pps_gen_gpio: reset edge event is too late [%lld.%09ld]\n", ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
 		goto done;
 	}
 
@@ -167,10 +197,10 @@ static enum hrtimer_restart hrtimer_callback_raise(struct hrtimer *timer)
    {
 		ktime_get_real_ts64(&ts1);
    } 
-   while ((ts_expire_req.tv_sec == ts1.tv_sec) && (ts1.tv_nsec < time_gpio_assert_ns));
+   while ((ts_expire_req.tv_sec == ts1.tv_sec) && (ts1.tv_nsec < time_gpio_change_ns));
 
 	/* Assert PPS GPIO. */
-	gpiod_set_value(devdata->pps_gpio, PPS_GPIO_HIGH);
+	gpiod_set_value(devdata->pps_gpio, gpio_reset);
 
 	ktime_get_real_ts64(&ts2);
 	local_irq_restore(irq_flags);
@@ -179,15 +209,18 @@ static enum hrtimer_restart hrtimer_callback_raise(struct hrtimer *timer)
 	ts_gpio_write_time = timespec64_sub(ts2, ts1);
 	devdata->gpio_write_time = (devdata->gpio_write_time + timespec64_to_ns(&ts_gpio_write_time)) / 2;
 
-   if (devdata->state == PPS_GPIO_ACTIVATING)
+   if (pps_sync_mode == PPS_SYNC_RAISING_EDGE)
    {
-      devdata->state = PPS_GPIO_ACTIVE;
-   	pr_info("pps_gen_gpio: state changed to ACTIVE\n");
-   }
-   else if (devdata->state == PPS_GPIO_DEACTIVATING)
-   {
-      devdata->state = PPS_GPIO_INACTIVE;
-   	pr_info("pps_gen_gpio: state changed to INACTIVE\n");
+      if (devdata->state == PPS_GPIO_ACTIVATING)
+      {
+         devdata->state = PPS_GPIO_ACTIVE;
+         pr_info("pps_gen_gpio: state changed to ACTIVE\n");
+      }
+      else if (devdata->state == PPS_GPIO_DEACTIVATING)
+      {
+         devdata->state = PPS_GPIO_INACTIVE;
+         pr_info("pps_gen_gpio: state changed to INACTIVE\n");
+      }
    }
 
 done:
@@ -195,19 +228,21 @@ done:
    update_hrtimer_latency(ts_expire_real, ts_expire_req);
 
 	/* Update the hrtimer expire time. */
-	hrtimer_set_expires(timer, ktime_set(ts_expire_req.tv_sec + 1, time_gpio_assert_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS));
+	hrtimer_set_expires(timer, ktime_set(ts_expire_req.tv_sec + 1, time_gpio_change_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS));
 	return HRTIMER_RESTART;
 }
 
-/* hrtimer drop event callback */
-static enum hrtimer_restart hrtimer_callback_drop(struct hrtimer *timer)
+/* hrtimer sync edge event callback */
+static enum hrtimer_restart hrtimer_callback_sync_edge(struct hrtimer *timer)
 {
 	unsigned long irq_flags;
-	struct pps_gen_gpio_devdata *devdata = container_of(timer, struct pps_gen_gpio_devdata, timer_drop);
-	const long time_gpio_deassert_ns = NSEC_PER_SEC - devdata->gpio_write_time;
+	struct pps_gen_gpio_devdata *devdata = container_of(timer, struct pps_gen_gpio_devdata, timer_sync_edge);
+	const long time_gpio_change_ns = NSEC_PER_SEC - devdata->gpio_write_time;
 	struct timespec64 ts_expire_req, ts_expire_real, ts_gpio_write_time, ts1, ts2;
 
-   if (devdata->state != PPS_GPIO_ACTIVE)
+   if ((devdata->state == PPS_GPIO_INACTIVE) ||
+       (devdata->state == PPS_GPIO_ACTIVATING) ||
+       ((devdata->state == PPS_GPIO_DEACTIVATING) && (pps_sync_mode == PPS_SYNC_RAISING_EDGE)))
    {
    	ktime_get_real_ts64(&ts_expire_real);
    	ts_expire_req = ktime_to_timespec64(hrtimer_get_softexpires(timer));
@@ -225,22 +260,22 @@ static enum hrtimer_restart hrtimer_callback_drop(struct hrtimer *timer)
 	/* Get current timestamp and requested time to check if we are late. */
 	ktime_get_real_ts64(&ts_expire_real);
 	ts_expire_req = ktime_to_timespec64(hrtimer_get_softexpires(timer));
-	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec || ts_expire_real.tv_nsec > time_gpio_deassert_ns)
+	if (ts_expire_req.tv_sec != ts_expire_real.tv_sec || ts_expire_real.tv_nsec > time_gpio_change_ns)
    {
 		local_irq_restore(irq_flags);
-		pr_err("pps_gen_gpio: drop event is too late [%lld.%09ld]\n", ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
+		pr_err("pps_gen_gpio: sync edge event is too late [%lld.%09ld]\n", ts_expire_real.tv_sec, ts_expire_real.tv_nsec);
 		goto done;
 	}
 
-	/* Busy loop until the time is right for a GPIO deassert. */
+	/* Busy loop until the time is right for a GPIO change. */
 	do
    {
 		ktime_get_real_ts64(&ts1);
    }
-	while ((ts_expire_req.tv_sec == ts1.tv_sec) && (ts1.tv_nsec < time_gpio_deassert_ns));
+	while ((ts_expire_req.tv_sec == ts1.tv_sec) && (ts1.tv_nsec < time_gpio_change_ns));
 
-	/* Deassert PPS GPIO. */
-	gpiod_set_value(devdata->pps_gpio, PPS_GPIO_LOW);
+	/* Change PPS GPIO. */
+	gpiod_set_value(devdata->pps_gpio, gpio_sync);
 
 	ktime_get_real_ts64(&ts2);
 	local_irq_restore(irq_flags);
@@ -250,11 +285,25 @@ static enum hrtimer_restart hrtimer_callback_drop(struct hrtimer *timer)
 	devdata->gpio_write_time = (devdata->gpio_write_time + timespec64_to_ns(&ts_gpio_write_time)) / 2;
 
 done:
+   if (pps_sync_mode == PPS_SYNC_FALLING_EDGE)
+   {
+      if (devdata->state == PPS_GPIO_ACTIVATING)
+      {
+         devdata->state = PPS_GPIO_ACTIVE;
+         pr_info("pps_gen_gpio: state changed to ACTIVE\n");
+      }
+      else if (devdata->state == PPS_GPIO_DEACTIVATING)
+      {
+         devdata->state = PPS_GPIO_INACTIVE;
+         pr_info("pps_gen_gpio: state changed to INACTIVE\n");
+      }
+   }
+
 	/* Update the average hrtimer latency. */
    update_hrtimer_latency(ts_expire_real, ts_expire_req);
 
 	/* Update the hrtimer expire time. */
-	hrtimer_set_expires(timer, ktime_set(ts_expire_req.tv_sec + 1, time_gpio_deassert_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS));
+	hrtimer_set_expires(timer, ktime_set(ts_expire_req.tv_sec + 1, time_gpio_change_ns - hrtimer_avg_latency - SAFETY_INTERVAL_NS));
 	return HRTIMER_RESTART;
 }
 
@@ -271,7 +320,7 @@ static void pps_gen_calibrate(struct pps_gen_gpio_devdata *devdata)
 
 		local_irq_save(irq_flags);
 		ktime_get_real_ts64(&ts1);
-		gpiod_set_value(devdata->pps_gpio, PPS_GPIO_HIGH);
+		gpiod_set_value(devdata->pps_gpio, 0);
 		ktime_get_real_ts64(&ts2);
 		local_irq_restore(irq_flags);
 
@@ -293,6 +342,24 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 	struct pps_gen_gpio_devdata *devdata;
 	struct timespec64 ts;
 
+   if ((pps_sync_mode != PPS_SYNC_RAISING_EDGE) && (pps_sync_mode != PPS_SYNC_FALLING_EDGE))
+   {
+		dev_err(dev, "pps_gen_gpio: invalid mode value %d\n", pps_sync_mode);
+		ret = -EINVAL;
+		goto err_alloc;
+   }
+
+   if (pps_sync_mode == PPS_SYNC_RAISING_EDGE)
+   {
+      gpio_sync = 1;
+      gpio_reset = 0;
+   }
+   else
+   {
+      gpio_sync = 0;
+      gpio_reset = 1;
+   }
+
 	/* Allocate space for device info. */
 	devdata = devm_kzalloc(dev, sizeof(struct pps_gen_gpio_devdata), GFP_KERNEL);
 	if (!devdata)
@@ -309,7 +376,7 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 		goto err_dt;
 	}
 
-	devdata->pps_gpio = devm_gpiod_get(dev, "pps-gen", GPIOD_OUT_HIGH);
+	devdata->pps_gpio = devm_gpiod_get(dev, "pps-gen", GPIOD_OUT_LOW);
 	if (IS_ERR(devdata->pps_gpio))
    {
 		ret = PTR_ERR(devdata->pps_gpio);
@@ -319,7 +386,7 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, devdata);
 
-	ret = gpiod_direction_output(devdata->pps_gpio, PPS_GPIO_HIGH);
+	ret = gpiod_direction_output(devdata->pps_gpio, GPIOD_OUT_LOW);
 	if (ret < 0)
    {
 		dev_err(dev, "pps_gen_gpio: cannot configure PPS GPIO\n");
@@ -335,18 +402,21 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 		goto err_gpio_dir;
    }
 
-	hrtimer_init(&devdata->timer_raise, CLOCK_REALTIME, HRTIMER_MODE_ABS);
-	devdata->timer_raise.function = hrtimer_callback_raise;
+	hrtimer_init(&devdata->timer_sync_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS);
+	devdata->timer_sync_edge.function = hrtimer_callback_sync_edge;
 
-	hrtimer_init(&devdata->timer_drop, CLOCK_REALTIME, HRTIMER_MODE_ABS);
-	devdata->timer_drop.function = hrtimer_callback_drop;
+	hrtimer_init(&devdata->timer_reset_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS);
+	devdata->timer_reset_edge.function = hrtimer_callback_reset_edge;
 
 	ktime_get_real_ts64(&ts);
 
-	hrtimer_start(&devdata->timer_raise,
-		      ktime_set(ts.tv_sec + 1, NSEC_PER_SEC / 2 - devdata->gpio_write_time - SAFETY_INTERVAL_NS),
+	hrtimer_start(&devdata->timer_reset_edge,
+		      ktime_set(ts.tv_sec + 1, 
+               (pps_sync_mode == PPS_SYNC_FALLING_EDGE) ?
+                  pps_pulse_width * NSEC_PER_MSEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS :
+                  (1000 - pps_pulse_width) * NSEC_PER_MSEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS),
 		      HRTIMER_MODE_ABS);
-	hrtimer_start(&devdata->timer_drop,
+	hrtimer_start(&devdata->timer_sync_edge,
 		      ktime_set(ts.tv_sec + 1, NSEC_PER_SEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS),
 		      HRTIMER_MODE_ABS);
 	return 0;
@@ -366,8 +436,8 @@ static int pps_gen_gpio_remove(struct platform_device *pdev)
 	struct pps_gen_gpio_devdata *devdata = platform_get_drvdata(pdev);
    sysfs_remove_group(&pdev->dev.kobj, &state_group);
 	devm_gpiod_put(dev, devdata->pps_gpio);
-	hrtimer_cancel(&devdata->timer_raise);
-	hrtimer_cancel(&devdata->timer_drop);
+	hrtimer_cancel(&devdata->timer_sync_edge);
+	hrtimer_cancel(&devdata->timer_reset_edge);
 	return 0;
 }
 

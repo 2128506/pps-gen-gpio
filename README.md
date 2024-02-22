@@ -6,7 +6,7 @@ Linux kernel PPS generator using GPIO pins.
 In kernel 5.10 there is no support for using a GPIO pin as a PPS generator, only a GPIO PPS client is available. This driver is derived from GPIO driver by 
 Juan Solano which is derived from the current parallel port PPS generator and provides a PPS signal through a GPIO pin specified in the device tree. The PPS signal is synchronized to the tv_sec increment of the wall clock. 
 
-This version of the driver generates long pulses (500ms) and provides activatin/deactivation via sysfs.
+This version of the driver generates long pulses (200ms by default, configurable) and provides activatin/deactivation via sysfs. Raising or falling edge synchronization mode can be selected.
 
 Tested on Radxa CM3 IO Board.
 
@@ -29,3 +29,7 @@ When loaded, driver sets configured PPS pin to high and waits for activation com
 
 To deactivate, write 0 to
       /sys/devices/pps-gen/state/active
+
+By default driver will be using raising edge for synchronization. This can be changed by providing parameter mode=1.
+
+Pulse width can be set via parameter width=nnn (where nnn is pulse width in milliseconds).
