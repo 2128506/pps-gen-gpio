@@ -145,15 +145,19 @@ static inline void update_hrtimer_latency(struct timespec64 ts_expire_real, stru
 	ts_hrtimer_latency = timespec64_sub(ts_expire_real, ts_expire_req);
 	hrtimer_latency = timespec64_to_ns(&ts_hrtimer_latency);
 
-	/* If the new latency value is bigger then the old, use the new
-	 * value, if not then slowly move towards the new value. This
-	 * way it should be safe in bad conditions and efficient in
-	 * good conditions.
-	 */
-	if (hrtimer_latency > hrtimer_avg_latency)
-		hrtimer_avg_latency = hrtimer_latency;
-	else
-		hrtimer_avg_latency = (3 * hrtimer_avg_latency + hrtimer_latency) / 4;
+   /* Ignore negative values (seen this on boot, could be that expire_real < expire_req ?) */
+   if (hrtimer_latency >= 0)
+   {
+      /* If the new latency value is bigger then the old, use the new
+      * value, if not then slowly move towards the new value. This
+      * way it should be safe in bad conditions and efficient in
+      * good conditions.
+      */
+      if (hrtimer_latency > hrtimer_avg_latency)
+         hrtimer_avg_latency = hrtimer_latency;
+      else
+         hrtimer_avg_latency = (3 * hrtimer_avg_latency + hrtimer_latency) / 4;
+   }
 }
 
 /* hrtimer front edge event callback */
