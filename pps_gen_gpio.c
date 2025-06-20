@@ -3,7 +3,7 @@
  *
  * Copyright (C)  2009   Alexander Gordeev <lasaine@lvk.cs.msu.su>
  *                2018   Juan Solano <jsm@jsolano.com>
- *                2024   Victor Kirhenshtein <victor@netxms.com>
+ *                2025   Victor Kirhenshtein <victor@netxms.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,7 +30,7 @@ MODULE_AUTHOR("Victor Kirhenshtein <victor@netxms.com>");
 MODULE_DESCRIPTION(DRVDESC);
 MODULE_LICENSE("GPL");
 
-#define SAFETY_INTERVAL_NS             (10 * NSEC_PER_USEC)   /* 10us */
+#define SAFETY_INTERVAL_NS             (20 * NSEC_PER_USEC)   /* 20us */
 #define RESET_EDGE_EVENT_TOLERANCE_NS  (10 * NSEC_PER_MSEC)   /* 10ms */
 
 enum pps_sync_mode
@@ -145,8 +145,9 @@ static inline void update_hrtimer_latency(struct timespec64 ts_expire_real, stru
 	ts_hrtimer_latency = timespec64_sub(ts_expire_real, ts_expire_req);
 	hrtimer_latency = timespec64_to_ns(&ts_hrtimer_latency);
 
-   /* Ignore negative values (seen this on boot, could be that expire_real < expire_req ?) */
-   if (hrtimer_latency >= 0)
+   /* Ignore negative values (seen this on boot, could be that expire_real < expire_req ?)
+    * Ignore latencies bigger than 10ms */
+   if ((hrtimer_latency >= 0) && (hrtimer_latency < NSEC_PER_MSEC * 10))
    {
       /* If the new latency value is bigger then the old, use the new
       * value, if not then slowly move towards the new value. This
@@ -154,7 +155,7 @@ static inline void update_hrtimer_latency(struct timespec64 ts_expire_real, stru
       * good conditions.
       */
       if (hrtimer_latency > hrtimer_avg_latency)
-         hrtimer_avg_latency = hrtimer_latency;
+         hrtimer_avg_latency = (hrtimer_avg_latency + hrtimer_latency) / 2;
       else
          hrtimer_avg_latency = (3 * hrtimer_avg_latency + hrtimer_latency) / 4;
    }
@@ -406,10 +407,10 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
 		goto err_gpio_dir;
    }
 
-	hrtimer_init(&devdata->timer_sync_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS);
+	hrtimer_init(&devdata->timer_sync_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS_HARD);
 	devdata->timer_sync_edge.function = hrtimer_callback_sync_edge;
 
-	hrtimer_init(&devdata->timer_reset_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS);
+	hrtimer_init(&devdata->timer_reset_edge, CLOCK_REALTIME, HRTIMER_MODE_ABS_HARD);
 	devdata->timer_reset_edge.function = hrtimer_callback_reset_edge;
 
 	ktime_get_real_ts64(&ts);
@@ -419,10 +420,10 @@ static int pps_gen_gpio_probe(struct platform_device *pdev)
                (pps_sync_mode == PPS_SYNC_FALLING_EDGE) ?
                   pps_pulse_width * NSEC_PER_MSEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS :
                   (1000 - pps_pulse_width) * NSEC_PER_MSEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS),
-		      HRTIMER_MODE_ABS);
+		      HRTIMER_MODE_ABS_HARD);
 	hrtimer_start(&devdata->timer_sync_edge,
 		      ktime_set(ts.tv_sec + 1, NSEC_PER_SEC - devdata->gpio_write_time - SAFETY_INTERVAL_NS),
-		      HRTIMER_MODE_ABS);
+		      HRTIMER_MODE_ABS_HARD);
 	return 0;
 
 err_gpio_dir:
